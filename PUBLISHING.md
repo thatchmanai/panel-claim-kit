@@ -21,6 +21,8 @@ Gist, but do not publish a working local copy without checking it first.
 - [ ] A self-launch approval fails while `self_launch_enabled` is false.
 - [ ] The rendered board omits `private_details` and `reason`.
 - [ ] Expiry frees a machine with an expired active claim.
+- [ ] Fast-lane verdicts behave: free machine says CLAIM, a tagged candidate beside a tagged non-exclusive claim says FAST-LANE OK, same-app / clipboard / over-limit candidates say QUEUE, and an untagged claim says UNKNOWN.
+- [ ] A fast-lane session releases and expires without touching the main claim.
 
 ## Publication notes
 

@@ -195,6 +195,11 @@ this kit, its config, its state, or a request.
   request and queue lifetimes. (The kit ships with 60-minute default /
   240-minute maximum / 72-hour request / 168-hour queue lifetimes —
   adjust deliberately.)
+- [ ] **Fast lane (v0.2.0):** decide the fast-lane duration limit
+  (policy `fastlane_max_minutes`, shipped at 10) and whether your board
+  uses it at all. If it does, claims and requests must carry resource
+  tags (app, clipboard, modal, sign-in, park; `exclusive` on claims) —
+  untagged work fails closed to the queue by design.
 - [ ] **Stop path:** how the owner stops a session (a word to the
   registrar is enough in the registrar-operated stages), and how a stop
   is relayed if work is running in more than one place.

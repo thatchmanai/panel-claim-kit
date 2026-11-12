@@ -32,7 +32,7 @@ try:
 except Exception:  # pragma: no cover
     fcntl = None  # type: ignore
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 
 ACCESS_LEVELS = [
     "none",
@@ -50,6 +50,7 @@ REQUEST_STATUSES = [
     "requested",
     "queued",
     "claimed",
+    "fastlane_claimed",
     "released",
     "denied",
     "withdrawn",
@@ -68,7 +69,10 @@ DEFAULT_POLICY = {
     "request_ttl_hours": 72,
     "queue_ttl_hours": 168,
     "stale_after_minutes": 120,
+    "fastlane_max_minutes": 10,
 }
+
+MODAL_VALUES = ["no", "yes", "possible"]
 
 
 class ClaimError(Exception):
@@ -257,6 +261,9 @@ def normalize_request(state: Dict[str, Any], raw: Dict[str, Any], now: dt.dateti
     if proposed_priority not in PRIORITIES:
         raise ClaimError(f"proposed_priority must be one of: {', '.join(PRIORITIES)}")
 
+    resources = normalize_resources(raw.get("resources"))
+    exclusive = bool_value(raw.get("exclusive", False), "exclusive")
+
     caps_raw = raw.get("capabilities", {}) or {}
     if not isinstance(caps_raw, dict):
         raise ClaimError("capabilities must be an object")
@@ -296,6 +303,8 @@ def normalize_request(state: Dict[str, Any], raw: Dict[str, Any], now: dt.dateti
         "proposed_priority": proposed_priority,
         "effective_priority": None,
         "capabilities": capabilities,
+        "resources": resources,
+        "exclusive": exclusive,
         "owner_approval_ref": str(raw.get("owner_approval_ref", "")),
         "status": status,
         "created_at": iso(now),
@@ -308,6 +317,114 @@ def normalize_request(state: Dict[str, Any], raw: Dict[str, Any], now: dt.dateti
         "expires_at": None,
         "decision_note": "",
     }
+
+def normalize_resources(raw: Any) -> Optional[Dict[str, Any]]:
+    """Resource tags for the fast-lane check (v0.2.0).
+
+    A request may carry a `resources` object describing what its session
+    will touch: the app it drives, whether it uses the shared clipboard,
+    whether a modal dialog may appear, whether it needs a sign-in step,
+    and whether it involves parking/fullscreen. Missing subfields stay
+    None on purpose: the fast-lane verdict treats them as unknown and
+    fails closed. `duration_minutes` doubles as the candidate's estimate.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ClaimError("resources must be an object")
+    app = raw.get("app")
+    if app is not None:
+        app = str(app).strip().lower()
+        if not app:
+            app = None
+    modal = raw.get("modal")
+    if modal is not None:
+        modal = str(modal).strip().lower()
+        if modal not in MODAL_VALUES:
+            raise ClaimError(f"resources.modal must be one of: {', '.join(MODAL_VALUES)}")
+    def opt_bool(key: str) -> Optional[bool]:
+        value = raw.get(key)
+        if value is None:
+            return None
+        return bool_value(value, f"resources.{key}")
+    return {
+        "app": app,
+        "uses_clipboard": opt_bool("uses_clipboard"),
+        "modal": modal,
+        "signin": opt_bool("signin"),
+        "park": opt_bool("park"),
+    }
+
+
+def fastlane_verdict(state: Dict[str, Any], machine_id: str, candidate: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Decide whether `candidate` may run beside the machine's active claim.
+
+    Mirrors the live queue-board checker (board step 3b): verdicts are
+    FAST-LANE OK, CLAIM (machine free -- take a normal claim instead),
+    QUEUE, and UNKNOWN (fail closed; treat as QUEUE). The verdict is
+    bookkeeping advice to the registrar, in the same spirit as the rest
+    of this kit: it records the decision rule, it does not launch or
+    control anything.
+    """
+    machine = get_machine(state, machine_id)
+    policy = state.get("policy", DEFAULT_POLICY)
+    max_minutes = int(policy.get("fastlane_max_minutes", 10))
+    reasons: List[str] = []
+
+    active_id = machine.get("active_claim")
+    if not active_id:
+        return "CLAIM", ["machine is free -- take a normal claim, the fast lane is not needed"]
+    if machine.get("active_fastlane"):
+        return "QUEUE", ["a fast-lane session is already active on this machine (one at a time)"]
+
+    cand_res = candidate.get("resources")
+    if not cand_res or not cand_res.get("app"):
+        return "UNKNOWN", ["candidate request carries no resource tags"]
+    for key in ("uses_clipboard", "modal", "signin", "park"):
+        if cand_res.get(key) is None:
+            return "UNKNOWN", [f"candidate resource tag missing: {key}"]
+
+    active = find_request(state, active_id)
+    claim_res = active.get("resources")
+    if not claim_res or not claim_res.get("app"):
+        return "UNKNOWN", ["the active claim carries no resource tags -- fail closed"]
+
+    if active.get("exclusive"):
+        reasons.append("the active claim is marked exclusive")
+    if cand_res["app"] == claim_res["app"]:
+        reasons.append(f"candidate drives the same app as the claim ({claim_res['app']})")
+    if int(candidate.get("duration_minutes", 0)) > max_minutes:
+        reasons.append(f"candidate duration {candidate.get('duration_minutes')}m exceeds the fast-lane limit ({max_minutes}m)")
+    if cand_res["uses_clipboard"]:
+        reasons.append("candidate uses the shared clipboard")
+    if cand_res["modal"] != "no":
+        reasons.append(f"candidate modal is {cand_res['modal']!r} (must be 'no')")
+    if cand_res["signin"]:
+        reasons.append("candidate needs a sign-in or password step")
+    if cand_res["park"]:
+        reasons.append("candidate involves park/fullscreen")
+    if reasons:
+        return "QUEUE", reasons
+    return "FAST-LANE OK", [
+        f"different app (claim: {claim_res['app']}, candidate: {cand_res['app']}), "
+        f"no clipboard, duration {candidate.get('duration_minutes')}m within the {max_minutes}m limit, "
+        "modal/signin/park all clear"
+    ]
+
+
+def promote_fastlane(state: Dict[str, Any], request: Dict[str, Any], now: dt.datetime) -> None:
+    machine = get_machine(state, request["machine"])
+    if not machine.get("active_claim"):
+        raise ClaimError(f"machine {request['machine']} has no active claim to run beside")
+    if machine.get("active_fastlane"):
+        raise ClaimError(f"machine {request['machine']} already has an active fast-lane session")
+    request["status"] = "fastlane_claimed"
+    request["claimed_at"] = iso(now)
+    request["last_heartbeat_at"] = iso(now)
+    request["expires_at"] = iso(now + dt.timedelta(minutes=int(request["duration_minutes"])))
+    request["updated_at"] = iso(now)
+    machine["active_fastlane"] = request["id"]
+    machine["updated_at"] = iso(now)
 
 
 def queue_for_machine(state: Dict[str, Any], machine_id: str) -> List[Dict[str, Any]]:
@@ -367,6 +484,14 @@ KEY_ALIASES = {
     "can self-launch": "can_self_launch",
     "can monitor": "can_monitor",
     "can release": "can_release",
+    "app": "app",
+    "uses clipboard": "uses_clipboard",
+    "clipboard": "uses_clipboard",
+    "modal": "modal",
+    "signin": "signin",
+    "sign-in": "signin",
+    "park": "park",
+    "exclusive": "exclusive",
 }
 
 
@@ -379,6 +504,7 @@ def parse_markdown_request(text: str) -> Dict[str, Any]:
     block = extract_panel_claim_block(text)
     values: Dict[str, Any] = {}
     capabilities: Dict[str, Any] = {}
+    resource_bits: Dict[str, Any] = {}
     for line in block.splitlines():
         if ":" not in line:
             continue
@@ -388,7 +514,21 @@ def parse_markdown_request(text: str) -> Dict[str, Any]:
         if not target:
             continue
         value = value.strip()
-        if target in {"can_request", "can_self_launch", "can_monitor", "can_release"}:
+        if target in {"uses_clipboard", "signin", "park", "exclusive"}:
+            lowered = value.lower()
+            if lowered in TRUE_WORDS:
+                parsed_bool = True
+            elif lowered in FALSE_WORDS:
+                parsed_bool = False
+            else:
+                raise ClaimError(f"{key} must be yes or no")
+            if target == "exclusive":
+                values["exclusive"] = parsed_bool
+            else:
+                resource_bits[target] = parsed_bool
+        elif target in {"app", "modal"}:
+            resource_bits[target] = value
+        elif target in {"can_request", "can_self_launch", "can_monitor", "can_release"}:
             lowered = value.lower()
             if lowered in TRUE_WORDS:
                 capabilities[target] = True
@@ -402,6 +542,8 @@ def parse_markdown_request(text: str) -> Dict[str, Any]:
             values[target] = value
     if capabilities:
         values["capabilities"] = capabilities
+    if resource_bits:
+        values["resources"] = resource_bits
     return values
 
 
@@ -425,6 +567,12 @@ def render_board(state: Dict[str, Any], machine_id: str) -> str:
         if active.get("claimed_at"):
             lines.append(f"- **Since:** {active['claimed_at']}")
         lines.append(f"- **Current work:** {active['public_title']}")
+        fastlane_id = machine.get("active_fastlane")
+        if fastlane_id:
+            fl = find_request(state, fastlane_id)
+            fl_seat = state.get("seats", {}).get(fl["requester"], {})
+            fl_display = fl_seat.get("display_name", fl["requester"])
+            lines.append(f"- **Fast lane:** {fl_display} — {fl['public_title']} (panel claim {fl['id']})")
     else:
         lines.append("- **Status:** FREE")
         lines.append("- **Claimed by:** —")
@@ -483,6 +631,7 @@ def command_init(args: argparse.Namespace) -> int:
         machines[machine_id] = {
             "label": str((machine or {}).get("label", machine_id)),
             "active_claim": None,
+            "active_fastlane": None,
             "updated_at": None,
         }
     seats = config.get("seats", {}) or {}
@@ -523,6 +672,12 @@ def command_template(args: argparse.Namespace) -> int:
         print("Can self-launch: no")
         print("Can monitor: no")
         print("Can release: no")
+        print("App: ")
+        print("Uses clipboard: no")
+        print("Modal: no")
+        print("Signin: no")
+        print("Park: no")
+        print("Exclusive: no")
         print("Owner approval ref: ")
         print("```")
         return 0
@@ -543,6 +698,14 @@ def command_template(args: argparse.Namespace) -> int:
             "can_monitor": False,
             "can_release": False,
         },
+        "resources": {
+            "app": "",
+            "uses_clipboard": False,
+            "modal": "no",
+            "signin": False,
+            "park": False,
+        },
+        "exclusive": False,
         "owner_approval_ref": "",
     }
     print(json.dumps(template, indent=2))
@@ -678,7 +841,7 @@ def command_heartbeat(args: argparse.Namespace) -> int:
         state = load_state(state_path)
         state["_now_override"] = iso(now)
         request = find_request(state, args.request_id)
-        if request["status"] != "claimed":
+        if request["status"] not in {"claimed", "fastlane_claimed"}:
             raise ClaimError("only a claimed request can heartbeat")
         request["last_heartbeat_at"] = iso(now)
         if args.extend_minutes:
@@ -698,11 +861,14 @@ def command_release(args: argparse.Namespace) -> int:
         state = load_state(state_path)
         state["_now_override"] = iso(now)
         request = find_request(state, args.request_id)
-        if request["status"] != "claimed":
+        if request["status"] not in {"claimed", "fastlane_claimed"}:
             raise ClaimError("only a claimed request can be released")
         machine = get_machine(state, request["machine"])
         if machine.get("active_claim") == request["id"]:
             machine["active_claim"] = None
+            machine["updated_at"] = iso(now)
+        if machine.get("active_fastlane") == request["id"]:
+            machine["active_fastlane"] = None
             machine["updated_at"] = iso(now)
         request["status"] = "released"
         request["released_at"] = iso(now)
@@ -736,10 +902,13 @@ def command_expire(args: argparse.Namespace) -> int:
                 request["status"] = "expired"
                 request["updated_at"] = iso(now)
                 changed.append(request["id"])
-            elif status == "claimed" and request.get("expires_at") and now >= parse_time(request["expires_at"]):
+            elif status in {"claimed", "fastlane_claimed"} and request.get("expires_at") and now >= parse_time(request["expires_at"]):
                 machine = get_machine(state, request["machine"])
                 if machine.get("active_claim") == request["id"]:
                     machine["active_claim"] = None
+                    machine["updated_at"] = iso(now)
+                if machine.get("active_fastlane") == request["id"]:
+                    machine["active_fastlane"] = None
                     machine["updated_at"] = iso(now)
                 request["status"] = "expired"
                 request["released_at"] = iso(now)
@@ -748,6 +917,51 @@ def command_expire(args: argparse.Namespace) -> int:
         save_state(state_path, state)
         audit(state_path, state, "expire", args.by, None, {"expired": changed})
     print(json.dumps({"expired": changed}, indent=2))
+    return 0
+
+
+FASTLANE_EXIT = {"FAST-LANE OK": 0, "CLAIM": 0, "QUEUE": 2, "UNKNOWN": 3}
+
+
+def command_fastlane_check(args: argparse.Namespace) -> int:
+    state = load_state(Path(args.state))
+    raw = read_json_input(args.input)
+    now = parse_time(args.now)
+    candidate = normalize_request(state, raw, now)
+    verdict, reasons = fastlane_verdict(state, candidate["machine"], candidate)
+    print(json.dumps({"verdict": verdict, "machine": candidate["machine"], "reasons": reasons}, indent=2))
+    return FASTLANE_EXIT[verdict]
+
+
+def command_claim_fastlane(args: argparse.Namespace) -> int:
+    state_path = Path(args.state)
+    now = parse_time(args.now)
+    with state_lock(state_path):
+        state = load_state(state_path)
+        state["_now_override"] = iso(now)
+        machine = get_machine(state, args.machine)
+        if not machine.get("active_claim"):
+            raise ClaimError(f"machine {args.machine} has no active claim; use claim-next for a normal claim")
+        if machine.get("active_fastlane"):
+            raise ClaimError(f"machine {args.machine} already has an active fast-lane session: {machine['active_fastlane']}")
+        queue = queue_for_machine(state, args.machine)
+        if not queue:
+            raise ClaimError(f"no queued requests for machine {args.machine}")
+        verdicts = []
+        chosen = None
+        for candidate in queue:
+            verdict, reasons = fastlane_verdict(state, args.machine, candidate)
+            verdicts.append({"request": candidate["id"], "verdict": verdict, "reasons": reasons})
+            if verdict == "FAST-LANE OK":
+                chosen = candidate
+                break
+        if chosen is None:
+            summary = "; ".join(f"{v['request']}: {v['verdict']}" for v in verdicts)
+            raise ClaimError(f"no queued request passes the fast-lane check ({summary})")
+        promote_fastlane(state, chosen, now)
+        save_state(state_path, state)
+        audit(state_path, state, "claim_fastlane", args.by, chosen["id"], {"machine": args.machine})
+    print(json.dumps(chosen, indent=2))
     return 0
 
 
@@ -833,6 +1047,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("expire", help="Expire stale requests, queued items, and claims whose end time has passed.")
     p.add_argument("--by", default="registrar")
     p.set_defaults(func=command_expire)
+
+    p = sub.add_parser("fastlane-check", help="Check a candidate request against the machine's active claim (read-only). Exit 0 = FAST-LANE OK or CLAIM, 2 = QUEUE, 3 = UNKNOWN.")
+    p.add_argument("--input", required=True, help="Candidate request JSON path, or - for stdin.")
+    p.set_defaults(func=command_fastlane_check)
+
+    p = sub.add_parser("claim-fastlane", help="Promote the first queued request that passes the fast-lane check to a parallel fast-lane session beside the active claim.")
+    p.add_argument("--machine", required=True)
+    p.add_argument("--by", required=True)
+    p.set_defaults(func=command_claim_fastlane)
 
     p = sub.add_parser("render-board", help="Render a privacy-safe Markdown board snippet for one machine.")
     p.add_argument("--machine", required=True)

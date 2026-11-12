@@ -74,6 +74,53 @@ Requests and queued items expire. Active claims carry a bounded end time.
 The board renderer uses only the sanitized `public_title`; private details
 and reasons stay in the registrar's state file and never reach the board.
 
+## Fast lane: small jobs beside a claim (v0.2.0)
+
+One active claim per machine is the safe default, but it strands every
+small job behind a long session. The fast lane lets **one** small job run
+**beside** an active claim when the two provably cannot collide -- decided
+by resource tags and a checker, not by judgment in the moment.
+
+Every request may carry `resources` tags describing what its session
+will touch, plus an `exclusive` flag on the claim side:
+
+| Tag | Meaning |
+| --- | --- |
+| `app` | The app the session drives (compared against the claim's). |
+| `uses_clipboard` | It copies/pastes through the shared system clipboard. |
+| `modal` | A modal dialog may appear: `no`, `yes`, or `possible`. |
+| `signin` | It needs a sign-in or password step. |
+| `park` | It involves parking the machine or toggling fullscreen. |
+| `exclusive` (claim) | Nothing may run beside this claim, ever. |
+
+`fastlane-check` compares a candidate against the machine's active claim
+and returns one of four verdicts:
+
+| Verdict | Exit | Meaning |
+| --- | --- | --- |
+| `CLAIM` | 0 | Machine is free -- take a normal claim; no fast lane needed. |
+| `FAST-LANE OK` | 0 | Different app, within the duration limit (policy `fastlane_max_minutes`, default 10), no clipboard, `modal` is `no`, no sign-in, no park step, claim not exclusive. |
+| `QUEUE` | 2 | Any criterion fails, or a fast-lane session is already active. |
+| `UNKNOWN` | 3 | Tags are missing on the candidate **or the claim** -- fail closed; treat as QUEUE. |
+
+The verdict is binding bookkeeping: a registrar does not override QUEUE
+or UNKNOWN by judgment. `claim-fastlane` promotes the first queued
+request that passes to a `fastlane_claimed` session beside the claim; it
+releases and expires exactly like a claim, and the board renders it on
+its own `Fast lane:` line.
+
+```sh
+python3 panel_claim.py --state panel-claim-state.json \
+  fastlane-check --input examples/fastlane-request.json
+
+python3 panel_claim.py --state panel-claim-state.json \
+  claim-fastlane --machine shared-mac-1 --by registrar
+```
+
+This generalizes a rule proven on a live queue board: claims carry the
+same tags in a `[tags: ...]` suffix, and a standalone checker applies the
+same conflict matrix before any small job is allowed beside a claim.
+
 ## Porting this kit to another setup
 
 The kit is deliberately environment-free: generic machine and seat IDs,
@@ -129,8 +176,9 @@ python3 panel_claim.py --state panel-claim-state.json submit --input request.jso
   supply, and the extra gates before self-launch.
 - `panel_claim_schema.json` — JSON Schema for a request.
 - `templates/claim-intake.md` — the member-facing intake form.
-- `examples/` — a generic configuration and three sample outcomes:
-  reservation, decline, and capability-blocked self-launch.
+- `examples/` — a generic configuration and four sample outcomes:
+  reservation, decline, capability-blocked self-launch, and a tagged
+  fast-lane candidate.
 - `tests/test_panel_claim.py` — end-to-end CLI tests.
 - `run_tests.sh` — runs the test suite.
 - `PUBLISHING.md` — a pre-publication checklist.
@@ -175,7 +223,8 @@ owner's explicit approval.
 - A decline is data, not a failed conversion.
 - A requester proposes priority; the registrar sets effective priority.
 - Public board text is sanitized by construction.
-- One active claim per machine.
+- One active claim per machine — plus at most one fast-lane session
+  beside it, admitted only by the tag checker (v0.2.0).
 - Every meaningful transition is written to an append-only audit log.
 - Expiry is normal behavior, not an error.
 - The code that records trust decisions should not itself hold credentials.
