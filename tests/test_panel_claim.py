@@ -169,6 +169,114 @@ Can release: no
         self.assertIn("submit", actions)
         self.assertIn("approve", actions)
 
+    # -- Fast lane (v0.2.0) -------------------------------------------------
+
+    def write_request(self, name, **overrides):
+        base = {
+            "requester": "example-seat-b",
+            "machine": "shared-mac-1",
+            "preference": "accept",
+            "requested_access": "reservation_request",
+            "public_title": "Fast-lane candidate work",
+            "duration_minutes": 5,
+            "proposed_priority": "normal",
+            "capabilities": {"can_request": True, "can_self_launch": False, "can_monitor": False, "can_release": False},
+            "resources": {"app": "utility-app", "uses_clipboard": False, "modal": "no", "signin": False, "park": False},
+        }
+        base.update(overrides)
+        path = self.dir / name
+        path.write_text(json.dumps(base), encoding="utf-8")
+        return path
+
+    def claim_browser_session(self, **claim_overrides):
+        claim = {
+            "requester": "example-seat-a",
+            "machine": "shared-mac-1",
+            "preference": "accept",
+            "requested_access": "reservation_request",
+            "public_title": "Long browser session",
+            "duration_minutes": 60,
+            "proposed_priority": "normal",
+            "capabilities": {"can_request": True, "can_self_launch": False, "can_monitor": False, "can_release": False},
+            "resources": {"app": "browser", "uses_clipboard": True, "modal": "possible", "signin": False, "park": False},
+        }
+        claim.update(claim_overrides)
+        path = self.dir / "claim.json"
+        path.write_text(json.dumps(claim), encoding="utf-8")
+        request = self.submit(path)
+        self.run_cli("--state", str(self.state), "approve", request["id"], "--by", "test-registrar", "--claim-if-free")
+        return request
+
+    def fastlane_check(self, path, expect=0):
+        return self.run_cli("--state", str(self.state), "fastlane-check", "--input", str(path), expect=expect)
+
+    def test_fastlane_ok_then_claim_fastlane_and_release(self):
+        self.claim_browser_session()
+        candidate_path = self.write_request("cand.json")
+        result = self.fastlane_check(candidate_path)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "FAST-LANE OK")
+
+        candidate = self.submit(candidate_path)
+        self.run_cli("--state", str(self.state), "approve", candidate["id"], "--by", "test-registrar")
+        promoted = json.loads(self.run_cli("--state", str(self.state), "claim-fastlane", "--machine", "shared-mac-1", "--by", "test-registrar").stdout)
+        self.assertEqual(promoted["status"], "fastlane_claimed")
+        state = self.load_state()
+        machine = state["machines"]["shared-mac-1"]
+        self.assertEqual(machine["active_fastlane"], candidate["id"])
+        self.assertIsNotNone(machine["active_claim"])
+
+        board = self.run_cli("--state", str(self.state), "render-board", "--machine", "shared-mac-1").stdout
+        self.assertIn("Fast lane:", board)
+
+        released = json.loads(self.run_cli("--state", str(self.state), "release", candidate["id"], "--by", "test-registrar").stdout)
+        self.assertEqual(released["status"], "released")
+        state = self.load_state()
+        self.assertIsNone(state["machines"]["shared-mac-1"]["active_fastlane"])
+        self.assertIsNotNone(state["machines"]["shared-mac-1"]["active_claim"])
+
+    def test_fastlane_same_app_clipboard_and_duration_all_queue(self):
+        self.claim_browser_session()
+        same_app = self.write_request("same.json", resources={"app": "browser", "uses_clipboard": False, "modal": "no", "signin": False, "park": False})
+        result = self.fastlane_check(same_app, expect=1)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "QUEUE")
+
+        clip = self.write_request("clip.json", resources={"app": "utility-app", "uses_clipboard": True, "modal": "no", "signin": False, "park": False})
+        result = self.fastlane_check(clip, expect=1)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "QUEUE")
+
+        long_job = self.write_request("long.json", duration_minutes=30)
+        result = self.fastlane_check(long_job, expect=1)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "QUEUE")
+
+    def test_fastlane_untagged_claim_is_unknown_fail_closed(self):
+        legacy = self.submit(RESERVATION)  # the shipped example carries no resource tags
+        self.run_cli("--state", str(self.state), "approve", legacy["id"], "--by", "test-registrar", "--claim-if-free")
+        result = self.fastlane_check(self.write_request("cand2.json"), expect=1)
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "UNKNOWN")
+
+    def test_fastlane_free_machine_says_claim(self):
+        result = self.fastlane_check(self.write_request("cand3.json"))
+        self.assertEqual(json.loads(result.stdout)["verdict"], "CLAIM")
+
+    def test_fastlane_exclusive_claim_queues_everything(self):
+        self.claim_browser_session(exclusive=True)
+        result = self.fastlane_check(self.write_request("cand4.json"), expect=1)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "QUEUE")
+
+    def test_markdown_intake_parses_resource_tags(self):
+        intake = self.dir / "intake.md"
+        intake.write_text(
+            "Requester: example-seat-b\nMachine: shared-mac-1\nPublic title: Tagged intake\n"
+            "Duration minutes: 5\nApp: utility-app\nUses clipboard: no\nModal: no\n"
+            "Signin: no\nPark: no\nExclusive: no\n",
+            encoding="utf-8",
+        )
+        parsed = json.loads(self.run_cli("parse-markdown", "--input", str(intake)).stdout)
+        self.assertEqual(parsed["resources"]["app"], "utility-app")
+        self.assertFalse(parsed["resources"]["uses_clipboard"])
+        self.assertFalse(parsed["exclusive"])
 
 if __name__ == "__main__":
     unittest.main()
