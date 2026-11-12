@@ -19,6 +19,12 @@ Can request: yes
 Can self-launch: no
 Can monitor: no
 Can release: no
+App:
+Uses clipboard: no
+Modal: no
+Signin: no
+Park: no
+Exclusive: no
 Owner approval ref:
 ```
 
@@ -38,3 +44,13 @@ Answer based on what is true today, not what might be possible later:
 - Can you start a machine session without the registrar operating it?
 - Can you monitor progress or detect that the session is stuck?
 - Can you release the machine or call a reliable stop?
+
+## Resource tags (fast lane)
+
+The last six lines describe what your session will touch. They decide
+whether a small job may run beside another session's claim instead of
+waiting in the queue: a different app than the claim's, no clipboard
+use, no modal dialog, no sign-in step, and no parking/fullscreen change,
+within the fast-lane duration limit. Leave a tag blank and the answer is
+automatically "wait" — the check fails closed. `Exclusive: yes` on a
+claim means nothing may run beside it at all.
