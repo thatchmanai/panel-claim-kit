@@ -32,7 +32,7 @@ try:
 except Exception:  # pragma: no cover
     fcntl = None  # type: ignore
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 ACCESS_LEVELS = [
     "none",
@@ -874,8 +874,16 @@ def command_release(args: argparse.Namespace) -> int:
         request["released_at"] = iso(now)
         request["updated_at"] = iso(now)
         request["decision_note"] = args.outcome or request.get("decision_note", "")
+        # Park-at-release condition: a release may park the machine only
+        # when the releasing session was the machine's sole user. If the
+        # owner also used the machine during the session (concurrent use
+        # or the owner's own work on it), the park step is skipped and
+        # the screen is left exactly as the owner has it.
+        request["park_at_release"] = (
+            "skipped_shared_use" if getattr(args, "shared_use", False) else "allowed_sole_use"
+        )
         save_state(state_path, state)
-        audit(state_path, state, "release", args.by, request["id"], {"outcome": args.outcome or ""})
+        audit(state_path, state, "release", args.by, request["id"], {"outcome": args.outcome or "", "park_at_release": request["park_at_release"]})
     print(json.dumps(request, indent=2))
     return 0
 
@@ -1042,6 +1050,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("request_id")
     p.add_argument("--by", required=True)
     p.add_argument("--outcome", default="")
+    p.add_argument("--shared-use", action="store_true", help="The machine's owner also used the machine during this session (concurrent use or the owner's own work). The release records park_at_release=skipped_shared_use: the park step is conditional on sole use, so a shared session leaves the screen as the owner has it.")
     p.set_defaults(func=command_release)
 
     p = sub.add_parser("expire", help="Expire stale requests, queued items, and claims whose end time has passed.")

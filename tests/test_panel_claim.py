@@ -72,6 +72,33 @@ class PanelClaimCliTest(unittest.TestCase):
             ).stdout
         )
         self.assertEqual(released["status"], "released")
+        self.assertEqual(released["park_at_release"], "allowed_sole_use")
+        state = self.load_state()
+        self.assertIsNone(state["machines"]["shared-mac-1"]["active_claim"])
+
+    def test_release_shared_use_skips_park(self):
+        request = self.submit(RESERVATION)
+        approved = json.loads(
+            self.run_cli(
+                "--state", str(self.state),
+                "approve", request["id"],
+                "--by", "test-registrar",
+                "--claim-if-free",
+            ).stdout
+        )
+        self.assertEqual(approved["status"], "claimed")
+
+        released = json.loads(
+            self.run_cli(
+                "--state", str(self.state),
+                "release", request["id"],
+                "--by", "test-registrar",
+                "--shared-use",
+                "--outcome", "Owner worked the main display throughout.",
+            ).stdout
+        )
+        self.assertEqual(released["status"], "released")
+        self.assertEqual(released["park_at_release"], "skipped_shared_use")
         state = self.load_state()
         self.assertIsNone(state["machines"]["shared-mac-1"]["active_claim"])
 

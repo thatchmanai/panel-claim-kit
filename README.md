@@ -121,6 +121,42 @@ This generalizes a rule proven on a live queue board: claims carry the
 same tags in a `[tags: ...]` suffix, and a standalone checker applies the
 same conflict matrix before any small job is allowed beside a claim.
 
+## Park at release: sole use only (v0.3.0)
+
+On a never-saver machine, a session normally ends by parking the
+machine — a dim fullscreen screen that protects the display. That park
+step is **conditional on sole use**: a release parks the machine only
+when the releasing session was the machine's only user *and* is the one
+releasing it. If the owner also used the machine during the session —
+working the main display while the agent worked a second, extended
+display, or doing their own work alongside — the release must not seize
+the owner's screen fullscreen. The screen is left exactly as the owner
+has it, and an unparked machine after a shared session is correct
+state, not a defect.
+
+The kit records the decision on every release as `park_at_release`:
+
+- `allowed_sole_use` (default) — the session was the machine's sole
+  user; the environment's park step may run.
+- `skipped_shared_use` — pass `--shared-use` to `release` when the
+  owner also used the machine during the session; the park step is
+  skipped.
+
+```sh
+python3 panel_claim.py --state panel-claim-state.json \
+  release <request-id> --by registrar --shared-use \
+  --outcome "owner worked the main display throughout"
+```
+
+This generalizes a rule set after a real shared session: an agent
+drove a window on an extended tablet display while the owner worked
+the main screen undisrupted (the control channel's input is per-window,
+so the genuinely shared resources are the clipboard, focused-app
+keyboard shortcuts, and machine-global states like modals and
+fullscreen parking — not the whole desktop). The release left the
+machine unparked, a follow-up flagged that as a gap, and the owner's
+answer became the rule above.
+
 ## Porting this kit to another setup
 
 The kit is deliberately environment-free: generic machine and seat IDs,

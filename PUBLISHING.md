@@ -23,6 +23,7 @@ Gist, but do not publish a working local copy without checking it first.
 - [ ] Expiry frees a machine with an expired active claim.
 - [ ] Fast-lane verdicts behave: free machine says CLAIM, a tagged candidate beside a tagged non-exclusive claim says FAST-LANE OK, same-app / clipboard / over-limit candidates say QUEUE, and an untagged claim says UNKNOWN.
 - [ ] A fast-lane session releases and expires without touching the main claim.
+- [ ] A release records `park_at_release`: `allowed_sole_use` by default, `skipped_shared_use` with `--shared-use` (the park step is conditional on sole use).
 
 ## Publication notes
 
