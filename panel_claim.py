@@ -288,6 +288,9 @@ def normalize_request(state: Dict[str, Any], raw: Dict[str, Any], now: dt.dateti
     request_id = raw.get("id") or (
         f"req_{now.strftime('%Y%m%d%H%M%S')}_{slugify(requester)}_{secrets.token_hex(2)}"
     )
+    request_id = str(request_id)
+    if any(existing.get("id") == request_id for existing in state.get("requests", [])):
+        raise ClaimError(f"duplicate request id: {request_id}")
 
     return {
         "id": str(request_id),
@@ -537,7 +540,10 @@ def parse_markdown_request(text: str) -> Dict[str, Any]:
             else:
                 raise ClaimError(f"{key} must be yes or no")
         elif target == "duration_minutes":
-            values[target] = int(value)
+            try:
+                values[target] = int(value)
+            except ValueError:
+                raise ClaimError("duration_minutes must be an integer") from None
         else:
             values[target] = value
     if capabilities:

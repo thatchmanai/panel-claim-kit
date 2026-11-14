@@ -186,6 +186,31 @@ Can release: no
         self.assertEqual(parsed["duration_minutes"], 30)
         self.assertFalse(parsed["capabilities"]["can_self_launch"])
 
+    def test_duplicate_request_id_is_rejected(self):
+        path = self.write_request("dup.json", id="req_fixed_duplicate")
+        first = self.submit(path)
+        self.assertEqual(first["id"], "req_fixed_duplicate")
+        result = self.run_cli("--state", str(self.state), "submit", "--input", str(path), expect=1)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("duplicate request id", result.stderr)
+        matches = [r for r in self.load_state()["requests"] if r["id"] == "req_fixed_duplicate"]
+        self.assertEqual(len(matches), 1)
+
+    def test_markdown_invalid_duration_is_a_clean_error(self):
+        intake = self.dir / "bad-intake.md"
+        intake.write_text(
+            """```panel-claim
+Requester: example-seat-a
+Machine: shared-mac-1
+Duration minutes: abc
+```""",
+            encoding="utf-8",
+        )
+        result = self.run_cli("parse-markdown", "--input", str(intake), expect=1)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("duration_minutes must be an integer", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_audit_log_records_key_events(self):
         request = self.submit(RESERVATION)
         self.run_cli("--state", str(self.state), "approve", request["id"], "--by", "test-registrar")
