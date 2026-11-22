@@ -216,7 +216,7 @@ this kit, its config, its state, or a request.
 ## 8. Setup sequence for the receiving Muse
 
 1. Read `README.md` and this guide in full before running anything.
-2. Run the tests: `./run_tests.sh` — all tests must pass.
+2. Run the tests: `sh run_tests.sh` — all tests must pass.
 3. Copy `examples/config.example.json` to a **local, unpublished**
    config; replace the example machine and seat IDs with the real ones
    from §0 and §6.
