@@ -60,6 +60,24 @@ REQUEST_STATUSES = [
     "expired",
 ]
 
+# Statuses a request can never leave once reached. Deny/withdraw must
+# not overwrite them (a released claim is history, not a pending item).
+TERMINAL_STATUSES = {
+    "released",
+    "denied",
+    "withdrawn",
+    "declined",
+    "no_access_requested",
+    "capability_blocked",
+    "expired",
+}
+
+# Statuses in which the request currently holds the machine (as the main
+# claim or as the fast-lane session). Deny/withdraw on one of these
+# would strand the machine's active_claim/active_fastlane pointer on a
+# dead request; the only way out of an active status is release/expire.
+ACTIVE_STATUSES = {"claimed", "fastlane_claimed"}
+
 DEFAULT_POLICY = {
     "registrar_required": True,
     "self_launch_enabled": False,
@@ -114,6 +132,20 @@ def bool_value(value: Any, field: str) -> bool:
         if lowered in {"false", "no", "n", "0", ""}:
             return False
     raise ClaimError(f"{field} must be a boolean")
+
+
+def normalize_owner_approval_ref(value: Any) -> str:
+    """An owner approval reference counts only as a non-blank string.
+
+    JSON null, numbers, and other non-strings normalize to "" so a
+    missing reference can never stringify into a truthy value (the old
+    code turned null into the string "None", which satisfied the
+    approve gate's truthiness check). Strings are stripped, so a
+    whitespace-only reference counts as missing too.
+    """
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
 
 
 def clean_public_title(value: Any) -> str:
@@ -308,7 +340,7 @@ def normalize_request(state: Dict[str, Any], raw: Dict[str, Any], now: dt.dateti
         "capabilities": capabilities,
         "resources": resources,
         "exclusive": exclusive,
-        "owner_approval_ref": str(raw.get("owner_approval_ref", "")),
+        "owner_approval_ref": normalize_owner_approval_ref(raw.get("owner_approval_ref")),
         "status": status,
         "created_at": iso(now),
         "updated_at": iso(now),
@@ -343,11 +375,21 @@ def normalize_resources(raw: Any) -> Optional[Dict[str, Any]]:
     modal = raw.get("modal")
     if modal is not None:
         modal = str(modal).strip().lower()
-        if modal not in MODAL_VALUES:
+        if not modal:
+            # Blank means "not answered", exactly like a blank boolean
+            # tag below: keep None so the fast-lane verdict fails closed
+            # with UNKNOWN (claim-intake.md: a blank tag means "wait").
+            modal = None
+        elif modal not in MODAL_VALUES:
             raise ClaimError(f"resources.modal must be one of: {', '.join(MODAL_VALUES)}")
     def opt_bool(key: str) -> Optional[bool]:
         value = raw.get(key)
         if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            # Blank is "not answered", not False: keep None so the
+            # fast-lane verdict fails closed with UNKNOWN instead of
+            # treating an unanswered tag as a clear "no".
             return None
         return bool_value(value, f"resources.{key}")
     return {
@@ -374,11 +416,14 @@ def fastlane_verdict(state: Dict[str, Any], machine_id: str, candidate: Dict[str
     max_minutes = int(policy.get("fastlane_max_minutes", 10))
     reasons: List[str] = []
 
+    # The one-fast-lane-at-a-time check comes first: a fast lane can
+    # outlive the main claim it started beside, and a second candidate
+    # must QUEUE even when the main slot currently reads free.
+    if machine.get("active_fastlane"):
+        return "QUEUE", ["a fast-lane session is already active on this machine (one at a time)"]
     active_id = machine.get("active_claim")
     if not active_id:
         return "CLAIM", ["machine is free -- take a normal claim, the fast lane is not needed"]
-    if machine.get("active_fastlane"):
-        return "QUEUE", ["a fast-lane session is already active on this machine (one at a time)"]
 
     cand_res = candidate.get("resources")
     if not cand_res or not cand_res.get("app"):
@@ -445,10 +490,44 @@ def queue_for_machine(state: Dict[str, Any], machine_id: str) -> List[Dict[str, 
     )
 
 
+def check_fastlane_compatibility(state: Dict[str, Any], machine: Dict[str, Any], request: Dict[str, Any]) -> None:
+    """Fail closed if promoting `request` to main claim would clash with
+    a fast-lane session still running on the machine.
+
+    The fast-lane session was vetted against the *previous* claim, not
+    this one, so the incoming claim must re-clear the same rules
+    fastlane_verdict applies to a candidate beside a claim: both sides
+    carry app tags, the incoming claim is not exclusive, and the two
+    sessions drive different apps.
+    """
+    fastlane_id = machine.get("active_fastlane")
+    if not fastlane_id:
+        return
+    fastlane = find_request(state, fastlane_id)
+    claim_res = request.get("resources")
+    fl_res = fastlane.get("resources")
+    if not claim_res or not claim_res.get("app") or not fl_res or not fl_res.get("app"):
+        raise ClaimError(
+            f"machine {request['machine']} has an active fast-lane session ({fastlane_id}) "
+            "and the incoming claim or the fast-lane session carries no resource tags -- fail closed"
+        )
+    if request.get("exclusive"):
+        raise ClaimError(
+            f"machine {request['machine']} has an active fast-lane session ({fastlane_id}); "
+            "an exclusive claim cannot start until it releases"
+        )
+    if fl_res["app"] == claim_res["app"]:
+        raise ClaimError(
+            f"machine {request['machine']} has an active fast-lane session ({fastlane_id}) "
+            f"driving {fl_res['app']!r}, the same app as the incoming claim"
+        )
+
+
 def promote_claim(state: Dict[str, Any], request: Dict[str, Any], actor: str, now: dt.datetime) -> None:
     machine = get_machine(state, request["machine"])
     if machine.get("active_claim"):
         raise ClaimError(f"machine {request['machine']} already has an active claim")
+    check_fastlane_compatibility(state, machine, request)
     request["status"] = "claimed"
     request["claimed_at"] = iso(now)
     request["last_heartbeat_at"] = iso(now)
@@ -573,15 +652,19 @@ def render_board(state: Dict[str, Any], machine_id: str) -> str:
         if active.get("claimed_at"):
             lines.append(f"- **Since:** {active['claimed_at']}")
         lines.append(f"- **Current work:** {active['public_title']}")
-        fastlane_id = machine.get("active_fastlane")
-        if fastlane_id:
-            fl = find_request(state, fastlane_id)
-            fl_seat = state.get("seats", {}).get(fl["requester"], {})
-            fl_display = fl_seat.get("display_name", fl["requester"])
-            lines.append(f"- **Fast lane:** {fl_display} — {fl['public_title']} (panel claim {fl['id']})")
     else:
         lines.append("- **Status:** FREE")
         lines.append("- **Claimed by:** —")
+    # The fast-lane line renders whenever a fast-lane session is active,
+    # even after the main claim releases: the fast lane can outlive the
+    # claim it started beside, and the board must never read as simply
+    # FREE while a session is still running on the machine.
+    fastlane_id = machine.get("active_fastlane")
+    if fastlane_id:
+        fl = find_request(state, fastlane_id)
+        fl_seat = state.get("seats", {}).get(fl["requester"], {})
+        fl_display = fl_seat.get("display_name", fl["requester"])
+        lines.append(f"- **Fast lane:** {fl_display} — {fl['public_title']} (panel claim {fl['id']})")
     lines.append("- **Queue:**")
     queue = queue_for_machine(state, machine_id)
     if not queue:
@@ -766,10 +849,14 @@ def command_approve(args: argparse.Namespace) -> int:
         policy = state.get("policy", {})
         if policy.get("registrar_required", True) and not args.by:
             raise ClaimError("approve requires --by naming the registrar")
+        # Normalize both ref sources up front: null/non-string/blank refs
+        # count as missing everywhere (see normalize_owner_approval_ref).
+        cli_ref = normalize_owner_approval_ref(args.owner_approval_ref)
+        stored_ref = normalize_owner_approval_ref(request.get("owner_approval_ref"))
         if request["requested_access"] == "self_launch":
             if not policy.get("self_launch_enabled", False):
                 raise ClaimError("self_launch is disabled by policy; approval cannot enable it through this command")
-            if policy.get("owner_approval_required_for_self_launch", True) and not (args.owner_approval_ref or request.get("owner_approval_ref")):
+            if policy.get("owner_approval_required_for_self_launch", True) and not (cli_ref or stored_ref):
                 raise ClaimError("self_launch approval requires an owner approval reference")
         effective = args.effective_priority or request.get("proposed_priority") or "normal"
         if effective not in PRIORITIES:
@@ -780,8 +867,8 @@ def command_approve(args: argparse.Namespace) -> int:
         request["approved_by"] = args.by
         request["decision_note"] = args.note or ""
         request["updated_at"] = iso(now)
-        if args.owner_approval_ref:
-            request["owner_approval_ref"] = args.owner_approval_ref
+        if cli_ref:
+            request["owner_approval_ref"] = cli_ref
         claimed = False
         if args.claim_if_free:
             machine = get_machine(state, request["machine"])
@@ -809,8 +896,12 @@ def _decision(args: argparse.Namespace, status: str, action: str) -> int:
         state = load_state(state_path)
         state["_now_override"] = iso(now)
         request = find_request(state, args.request_id)
-        if request["status"] in {"claimed", "released"}:
-            raise ClaimError(f"cannot {action} a request in status {request['status']}")
+        if request["status"] in ACTIVE_STATUSES:
+            raise ClaimError(
+                f"cannot {action} a request that holds the machine (status {request['status']}); release it instead"
+            )
+        if request["status"] in TERMINAL_STATUSES:
+            raise ClaimError(f"cannot {action} a request in terminal status {request['status']}")
         request["status"] = status
         request["decision_note"] = args.note or ""
         request["updated_at"] = iso(now)

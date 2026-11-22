@@ -330,5 +330,165 @@ Duration minutes: abc
         self.assertFalse(parsed["resources"]["uses_clipboard"])
         self.assertFalse(parsed["exclusive"])
 
+    # -- Regression: owner-approval gate (null/blank refs) ------------------
+
+    def test_self_launch_owner_approval_ref_must_be_a_real_string(self):
+        config = json.loads(CONFIG.read_text(encoding="utf-8"))
+        config["policy"]["self_launch_enabled"] = True
+        config_path = self.dir / "config-self-launch.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        sl_state = self.dir / "state-sl.json"
+        self.run_cli("--state", str(sl_state), "init", "--config", str(config_path), "--by", "test-registrar")
+
+        base = json.loads(SELF_LAUNCH_BLOCKED.read_text(encoding="utf-8"))
+        base["capabilities"]["can_self_launch"] = True
+
+        def submit_variant(name, **overrides):
+            data = dict(base)
+            data.update(overrides)
+            path = self.dir / name
+            path.write_text(json.dumps(data), encoding="utf-8")
+            result = self.run_cli("--state", str(sl_state), "submit", "--input", str(path))
+            return json.loads(result.stdout)
+
+        # A JSON null ref normalizes to "" (never the string "None") and
+        # approval without a real ref fails -- as does a whitespace-only
+        # ref supplied on the command line.
+        null_req = submit_variant("sl-null.json", owner_approval_ref=None)
+        self.assertEqual(null_req["owner_approval_ref"], "")
+        self.assertEqual(null_req["status"], "requested")
+        self.run_cli("--state", str(sl_state), "approve", null_req["id"], "--by", "test-registrar", expect=2)
+        self.run_cli(
+            "--state", str(sl_state), "approve", null_req["id"],
+            "--by", "test-registrar", "--owner-approval-ref", "   ", expect=2,
+        )
+
+        # A whitespace-only stored ref counts as missing too.
+        blank_req = submit_variant("sl-blank.json", owner_approval_ref="   ")
+        self.assertEqual(blank_req["owner_approval_ref"], "")
+        self.run_cli("--state", str(sl_state), "approve", blank_req["id"], "--by", "test-registrar", expect=2)
+
+        # A real stored ref succeeds.
+        real_req = submit_variant("sl-real.json", owner_approval_ref="owner-msg-123")
+        approved = json.loads(
+            self.run_cli("--state", str(sl_state), "approve", real_req["id"], "--by", "test-registrar").stdout
+        )
+        self.assertEqual(approved["status"], "queued")
+
+        # A real CLI-supplied ref succeeds for a request with no stored ref.
+        cli_req = submit_variant("sl-cli.json", owner_approval_ref=None)
+        approved = json.loads(
+            self.run_cli(
+                "--state", str(sl_state), "approve", cli_req["id"],
+                "--by", "test-registrar", "--owner-approval-ref", "owner-msg-456",
+            ).stdout
+        )
+        self.assertEqual(approved["status"], "queued")
+        self.assertEqual(approved["owner_approval_ref"], "owner-msg-456")
+
+    # -- Regression: blank fast-lane tags fail closed ------------------------
+
+    def test_fastlane_blank_tags_are_unknown_fail_closed(self):
+        self.claim_browser_session()
+        blank_bool = self.write_request(
+            "blank-bool.json",
+            resources={"app": "utility-app", "uses_clipboard": "", "modal": "no", "signin": False, "park": False},
+        )
+        result = self.fastlane_check(blank_bool, expect=1)
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "UNKNOWN")
+
+        blank_modal = self.write_request(
+            "blank-modal.json",
+            resources={"app": "utility-app", "uses_clipboard": False, "modal": "", "signin": False, "park": False},
+        )
+        result = self.fastlane_check(blank_modal, expect=1)
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "UNKNOWN")
+
+    # -- Regression: fast-lane lifecycle guards ------------------------------
+
+    def claim_fastlane_session(self):
+        main = self.claim_browser_session()
+        candidate = self.submit(self.write_request("cand-fl.json"))
+        self.run_cli("--state", str(self.state), "approve", candidate["id"], "--by", "test-registrar")
+        promoted = json.loads(
+            self.run_cli("--state", str(self.state), "claim-fastlane", "--machine", "shared-mac-1", "--by", "test-registrar").stdout
+        )
+        self.assertEqual(promoted["status"], "fastlane_claimed")
+        return main, candidate
+
+    def test_deny_or_withdraw_fastlane_claim_fails_and_pointer_survives(self):
+        main, candidate = self.claim_fastlane_session()
+        self.run_cli("--state", str(self.state), "deny", candidate["id"], "--by", "test-registrar", expect=2)
+        self.run_cli("--state", str(self.state), "withdraw", candidate["id"], "--by", "example-seat-b", expect=2)
+        state = self.load_state()
+        self.assertEqual(state["machines"]["shared-mac-1"]["active_fastlane"], candidate["id"])
+        statuses = {r["id"]: r["status"] for r in state["requests"]}
+        self.assertEqual(statuses[candidate["id"]], "fastlane_claimed")
+
+    def test_deny_released_request_fails_terminal_status_sticks(self):
+        request = self.submit(RESERVATION)
+        self.run_cli("--state", str(self.state), "approve", request["id"], "--by", "test-registrar", "--claim-if-free")
+        self.run_cli("--state", str(self.state), "release", request["id"], "--by", "test-registrar")
+        self.run_cli("--state", str(self.state), "deny", request["id"], "--by", "test-registrar", expect=2)
+        statuses = {r["id"]: r["status"] for r in self.load_state()["requests"]}
+        self.assertEqual(statuses[request["id"]], "released")
+
+    def test_board_still_shows_fastlane_after_main_claim_releases(self):
+        main, candidate = self.claim_fastlane_session()
+        self.run_cli("--state", str(self.state), "release", main["id"], "--by", "test-registrar")
+        board = self.run_cli("--state", str(self.state), "render-board", "--machine", "shared-mac-1").stdout
+        self.assertIn("Fast lane:", board)
+        self.assertIn("Fast-lane candidate work", board)
+        machine = self.load_state()["machines"]["shared-mac-1"]
+        self.assertIsNone(machine["active_claim"])
+        self.assertEqual(machine["active_fastlane"], candidate["id"])
+
+    def test_second_fastlane_candidate_queues_while_one_active(self):
+        main, candidate = self.claim_fastlane_session()
+        result = self.fastlane_check(self.write_request("cand-second.json"), expect=1)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "QUEUE")
+        # Still QUEUE after the main claim releases (fast lane outlives it).
+        self.run_cli("--state", str(self.state), "release", main["id"], "--by", "test-registrar")
+        result = self.fastlane_check(self.write_request("cand-third.json"), expect=1)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "QUEUE")
+
+    def test_claim_next_blocked_when_incoming_claim_shares_fastlane_app(self):
+        main, candidate = self.claim_fastlane_session()
+        self.run_cli("--state", str(self.state), "release", main["id"], "--by", "test-registrar")
+        rival = self.submit(self.write_request(
+            "rival.json",
+            requester="example-seat-c",
+            public_title="Utility work too",
+            resources={"app": "utility-app", "uses_clipboard": False, "modal": "no", "signin": False, "park": False},
+        ))
+        self.run_cli("--state", str(self.state), "approve", rival["id"], "--by", "test-registrar")
+        self.run_cli("--state", str(self.state), "claim-next", "--machine", "shared-mac-1", "--by", "test-registrar", expect=2)
+        machine = self.load_state()["machines"]["shared-mac-1"]
+        self.assertIsNone(machine["active_claim"])
+        self.assertEqual(machine["active_fastlane"], candidate["id"])
+
+    def test_claim_next_compatible_with_running_fastlane(self):
+        main, candidate = self.claim_fastlane_session()
+        self.run_cli("--state", str(self.state), "release", main["id"], "--by", "test-registrar")
+        nxt = self.submit(self.write_request(
+            "next.json",
+            requester="example-seat-c",
+            public_title="Editor session",
+            resources={"app": "editor", "uses_clipboard": True, "modal": "possible", "signin": False, "park": False},
+        ))
+        self.run_cli("--state", str(self.state), "approve", nxt["id"], "--by", "test-registrar")
+        claimed = json.loads(
+            self.run_cli("--state", str(self.state), "claim-next", "--machine", "shared-mac-1", "--by", "test-registrar").stdout
+        )
+        self.assertEqual(claimed["status"], "claimed")
+        machine = self.load_state()["machines"]["shared-mac-1"]
+        self.assertEqual(machine["active_claim"], nxt["id"])
+        self.assertEqual(machine["active_fastlane"], candidate["id"])
+
+
 if __name__ == "__main__":
     unittest.main()
